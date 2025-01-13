@@ -3,266 +3,230 @@ import pandas as pd
 import plotly.express as px
 import numpy as np
 
-#  LOGIC / MODEL
+def simulate_scenario(
+    scenario_name,
+    days,
+    daily_growth,
+    initial_volume,
+    nb_ai_agents,
+    bond_curve_slope,
+    bond_curve_exponent,
+    bc_to_trading_ratio,
+    fee_burn_rbot,
+    fee_liquidity_bc,
+    fee_treasury,
+    shock_day=None,
+    shock_factor=1.0,
+    initial_rbot_supply=1_000_000,
+    elasticity=0.5
+):
+    """
+    Simule:
+    - Volume de transactions croissant,
+    - Création d'AI Agents (impact sur demande RBOT, burn...),
+    - Bonding Curve paramétrable (slope, exponent),
+    - Répartition fees (burn, BC liquidity, treasury),
+    - Seuil (bc_to_trading_ratio) pour l'allocation,
+    - Eventuel choc de marché (shock_day, shock_factor),
+    - Retourne un DataFrame avec variables clefs (burn, supply, price...).
+    """
+    df_records = []
+    total_fee_rate = 0.01
+    rbot_price = 1.0  # Hypothèse simple, ou on peut le modéliser plus complexe
+    rbot_supply = initial_rbot_supply
 
-def simulate_fees_scenario(volume_start,
-                           days,
-                           daily_growth,
-                           scenario,
-                           do_stress_test,
-                           shock_day,
-                           shock_factor,
-                           supply_start=1_000_000,
-                           elasticity=0.5):
+    current_volume = initial_volume
+    current_agents = 0
 
+    for d in range(1, days + 1):
+        # Croissance volume
+        if d > 1:
+            current_volume *= (1 + daily_growth)
 
-    # Définition des taux en fonction du SCENARIO (on reste sur 1% total)
-
-    if scenario == 'S1':
-        burn_rate = 0.30  # fraction du 1% pour le burn
-        liquidity_rate = 0.30
-        treasury_rate = 0.40
-    else:  # S2
-        burn_rate = 0.15
-        liquidity_rate = 0.10
-        treasury_rate = 0.75
-
-    total_fee_rate = 0.01  # 1%
-
-    # Hypothèses de base pour la modélisation du prix du token
-    # On suppose un "prix" initial arbitraire, ou corrélé à supply.
-    # Cf. "price ~ 1 / supply" * un facteur k, ici 2.0
-    price_token = 2.0 * (1_000_000 / supply_start)
-    supply = supply_start
-
-    records = []
-
-    current_volume = volume_start
-
-    for day in range(1, days + 1):
-        # EVENTUEL STRESS TEST
-        if do_stress_test and day == shock_day:
-            # choc => on multiplie le volume par shock_factor
-            # (ex. 0.5 = -50%, 1.5 = +50%, etc.)
+        # Choc si demandé
+        if shock_day and d == shock_day:
             current_volume *= shock_factor
 
-        # On applique la croissance journalière
-        if day > 1:  # on ne l'applique pas avant le day 1
-            current_volume = current_volume * (1 + daily_growth)
+        # Hypothèse: nouveau projet AI Agent chaque X jours => param "nb_ai_agents"
+        # Simplification: On répartit la création sur la durée:
+        agents_created_today = nb_ai_agents / days
+        current_agents += agents_created_today
 
-        # fees totaux sur la journée
+        # Bonding Curve (très simple) : si AI Agent se crée, on achète du RBOT => on calcule la "demande" sur RBOT
+        # Ex: daily_buy_rbot ~ bond_curve_slope * (current_agents+1)**bond_curve_exponent (toy model)
+        daily_buy_rbot = bond_curve_slope * (current_agents + 1)**bond_curve_exponent
+
+        # On met à jour la supply RBOT si on suppose qu'une partie est burn:
+        # Tout dépend du modèle: ici on imagine un burn direct proportionnel "fee_burn_rbot"
+        # sur le volume "current_volume * total_fee_rate"
         daily_fees = current_volume * total_fee_rate
+        daily_burn_rbot_usd = daily_fees * fee_burn_rbot
+        daily_liquidity_bc_usd = daily_fees * fee_liquidity_bc
+        daily_treasury_usd = daily_fees * fee_treasury
 
-        # Burn, liquidity, treasury
-        daily_burn = daily_fees * burn_rate
-        daily_liquidity = daily_fees * liquidity_rate
-        daily_treasury = daily_fees * treasury_rate
+        # Converti burn USD => RBOT burné (si rbot_price>0)
+        rbot_burned = (daily_burn_rbot_usd / rbot_price) if rbot_price > 0 else 0
+        rbot_supply = max(0, rbot_supply - rbot_burned)
 
-        # On décrémente la supply du token via le burn
-        # Ici, on suppose 1$ = 1 token, c'est TRÈS simplifié.
-        # Pour un vrai modèle, il faudrait convertir daily_burn en "nombre de tokens" rachetés.
-        # On fait un mini "approx" : tokens_burned = daily_burn / price_token.
-        tokens_burned = daily_burn / price_token
-        supply = max(0, supply - tokens_burned)
+        # On imagine que daily_buy_rbot en USD => la demande fait monter un peu le prix:
+        # Petit modèle: price ~ (some factor * daily_buy_rbot) / supply^elasticity
+        # ou tout autre variation simplifiée.
+        rbot_price_change = (daily_buy_rbot) / (rbot_supply**elasticity + 1e-9)
+        rbot_price = max(0, rbot_price + rbot_price_change)
 
-        # On recalcule un "nouveau prix" hypothétique en se basant sur la new supply
-        # price ~ 1 / supply ^ elasticity (ici, un usage artisanal)
-        # On scale un peu pour la démo
-        if supply > 0:
-            price_token = 2.0 * (1_000_000 / supply)**elasticity
-        else:
-            price_token = 0
+        # Trading Pool vs BC Liquidity (ratio bc_to_trading_ratio)
+        # Ex: 0.2 => 20% BC, 80% Trading
+        bc_liquidity = daily_liquidity_bc_usd * bc_to_trading_ratio
+        trading_pool_part = daily_liquidity_bc_usd * (1 - bc_to_trading_ratio)
 
-        records.append({
-            'day': day,
+        df_records.append({
+            'scenario': scenario_name,
+            'day': d,
             'volume': current_volume,
+            'agents_created_cumul': current_agents,
             'fees_total': daily_fees,
-            'burn_usd': daily_burn,
-            'liquidity_usd': daily_liquidity,
-            'treasury_usd': daily_treasury,
-            'tokens_burned': tokens_burned,
-            'supply': supply,
-            'price_token': price_token
+            'burn_rbot_usd': daily_burn_rbot_usd,
+            'burn_rbot_tokens': rbot_burned,
+            'bc_liquidity_usd': bc_liquidity,
+            'trading_pool_usd': trading_pool_part,
+            'treasury_usd': daily_treasury_usd,
+            'rbot_supply': rbot_supply,
+            'rbot_price': rbot_price
         })
 
-    df = pd.DataFrame(records)
-    return df
+    return pd.DataFrame(df_records)
 
+def page_app():
+    st.title("Digital Twin - Bonding Curve & Fees Simulation")
 
+    st.sidebar.header("Simulation Inputs")
 
-#  STREAMLIT APP
+    # Input global
+    days = st.sidebar.number_input("Days", 1, 365, 60)
+    daily_growth = st.sidebar.slider("Daily Growth %", -5.0, 10.0, 1.0, 0.5) / 100.0
+    initial_volume = st.sidebar.number_input("Initial Volume (USD)", 1_000, 10_000_000, 100_000, 10_000)
+    nb_ai_agents = st.sidebar.number_input("Number of AI Agents to Create", 0, 10_000, 50, 10)
 
-def show_basic_mode():
-    st.header("Mode Basique : Comparez 2 Scénarios (S1 vs S2)")
-    st.write("Ici, on simule la répartition des fees sur un volume de transactions, "
-             "avec un simple modèle de burn (sans trop d'artifices).")
+    # Bonding curve
+    st.sidebar.subheader("Bonding Curve")
+    bond_curve_slope = st.sidebar.number_input("BC Slope", 0.0, 100.0, 1.0, 0.1)
+    bond_curve_exponent = st.sidebar.number_input("BC Exponent", 0.0, 2.0, 1.0, 0.1)
 
-    # Inputs
-    volume_journalier = st.slider(
-        "Volume de transactions de départ (USD / jour)", 
-        min_value=10_000, max_value=2_000_000, step=10_000, value=100_000
-    )
-    days = st.slider("Nombre de jours de simulation", 1, 365, 30)
-    daily_growth = st.number_input("Croissance du volume par jour (en %)", -10.0, 10.0, 1.0, 0.1) / 100.0
+    # Ratio
+    st.sidebar.subheader("Liquidity Distribution")
+    bc_to_trading_ratio = st.sidebar.slider("BC Liquidity Ratio", 0.0, 1.0, 0.2, 0.05)
 
-    # Choix du scénario
-    scenario_choice = st.radio("Choisir Scénario", ("S1", "S2"))
+    # Fees rates (somme <=1, car total 1%)
+    st.sidebar.subheader("Fees Distribution (1% total)")
+    fee_burn_rbot = st.sidebar.slider("Burn RBOT fraction", 0.0, 1.0, 0.3, 0.05)
+    fee_liquidity_bc = st.sidebar.slider("Liquidity fraction", 0.0, 1.0 - fee_burn_rbot, 0.3, 0.05)
+    fee_treasury = st.sidebar.slider("Treasury fraction", 0.0, 1.0, 1.0 - (fee_burn_rbot + fee_liquidity_bc), 0.05)
 
-    # Bouton pour run
-    if st.button("Lancer la simulation"):
-        df_result = simulate_fees_scenario(volume_start=volume_journalier,
-                                           days=days,
-                                           daily_growth=daily_growth,
-                                           scenario=scenario_choice,
-                                           do_stress_test=False,
-                                           shock_day=9999,  # pas de choc
-                                           shock_factor=1.0)
+    # Shock
+    st.sidebar.subheader("Shock (Optional)")
+    do_shock = st.sidebar.checkbox("Enable Shock")
+    shock_day = None
+    shock_factor = 1.0
+    if do_shock:
+        shock_day = st.sidebar.slider("Shock Day", 1, days, 10)
+        shock_factor = st.sidebar.slider("Shock Factor", 0.1, 2.0, 0.5, 0.05)
 
-        st.subheader("Résultats (extraits)")
-        st.dataframe(df_result.head(20))
+    # Additional advanced
+    st.sidebar.subheader("RBOT Model")
+    initial_rbot_supply = st.sidebar.number_input("Initial RBOT Supply", 100_000, 10_000_000, 1_000_000, 100_000)
+    elasticity = st.sidebar.slider("Price Elasticity", 0.1, 2.0, 0.5, 0.1)
 
-        # Graph 1 : évolution Burn / Liquidity / Treasury
-        fig_fees = px.area(
-            df_result,
-            x='day',
-            y=['burn_usd', 'liquidity_usd', 'treasury_usd'],
-            title=f"Évolution journalière des fees (Scénario {scenario_choice})",
-            labels={"value": "USD", "day": "Jour"}
-        )
-        st.plotly_chart(fig_fees, use_container_width=True)
+    st.write("## Multiple Scenarios")
 
-        # Graph 2 : supply vs price
-        fig_price_supply = px.line(
-            df_result,
-            x='day',
-            y=['supply', 'price_token'],
-            title="Évolution de la supply et du prix (modèle simplifié)",
-            labels={"day": "Jour"}
-        )
-        st.plotly_chart(fig_price_supply, use_container_width=True)
+    n_scenarios = st.number_input("How many scenarios to compare?", 1, 5, 2)
+    scenario_params = []
+    for i in range(n_scenarios):
+        with st.expander(f"Scenario {i+1} Params"):
+            scen_name = st.text_input(f"Name for Scenario {i+1}", value=f"S{i+1}")
+            # On peut personnaliser par scenario
+            slope = st.number_input(f"BC Slope S{i+1}", 0.0, 100.0, bond_curve_slope, 0.1, key=f"slope_{i}")
+            exponent = st.number_input(f"BC Exponent S{i+1}", 0.0, 2.0, bond_curve_exponent, 0.1, key=f"exp_{i}")
+            burn_ = st.slider(f"Burn fraction S{i+1}", 0.0, 1.0, fee_burn_rbot, 0.05, key=f"burn_{i}")
+            liq_ = st.slider(f"Liquidity fraction S{i+1}", 0.0, 1.0 - burn_, fee_liquidity_bc, 0.05, key=f"liq_{i}")
+            trs_ = 1.0 - (burn_ + liq_)
+            st.write(f"Treasury fraction S{i+1}: {trs_:.2f}")
 
-        # Stats cumulées
-        total_burn = df_result['burn_usd'].sum()
-        total_treasury = df_result['treasury_usd'].sum()
-        final_price = df_result['price_token'].iloc[-1]
-        final_supply = df_result['supply'].iloc[-1]
+            scenario_params.append({
+                'scenario_name': scen_name,
+                'days': days,
+                'daily_growth': daily_growth,
+                'initial_volume': initial_volume,
+                'nb_ai_agents': nb_ai_agents,
+                'bond_curve_slope': slope,
+                'bond_curve_exponent': exponent,
+                'bc_to_trading_ratio': bc_to_trading_ratio,
+                'fee_burn_rbot': burn_,
+                'fee_liquidity_bc': liq_,
+                'fee_treasury': trs_,
+                'shock_day': shock_day if do_shock else None,
+                'shock_factor': shock_factor,
+                'initial_rbot_supply': initial_rbot_supply,
+                'elasticity': elasticity
+            })
 
-        st.markdown(f"**Burn total (USD) :** {total_burn:,.2f}")
-        st.markdown(f"**Trésorerie cumulée (USD) :** {total_treasury:,.2f}")
-        st.markdown(f"**Prix final du token (approx) :** {final_price:,.4f} $")
-        st.markdown(f"**Supply finale (approx) :** {final_supply:,.2f} tokens")
+    if st.button("Run Simulation(s)"):
+        df_all = []
+        for sp in scenario_params:
+            df_scen = simulate_scenario(**sp)
+            df_all.append(df_scen)
+        df_merged = pd.concat(df_all, ignore_index=True)
+        st.write(df_merged.head(20))
 
-
-def show_advanced_mode():
-    st.header("Mode Avancé : Stress Tests & Comparaison Multi-Scénarios")
-
-    with st.expander("Paramètres Généraux"):
-        volume_journalier = st.slider(
-            "Volume de transactions de départ (USD / jour)", 
-            min_value=10_000, max_value=2_000_000, step=10_000, value=200_000
-        )
-        days = st.slider("Nombre de jours de simulation", 1, 365, 60)
-        daily_growth = st.number_input("Croissance du volume par jour (en %)", -10.0, 10.0, 1.0, 0.1) / 100.0
-        elasticity = st.number_input("Elasticité (impact du burn sur le prix)", 0.1, 2.0, 0.5, 0.1)
-        supply_start = st.number_input("Supply initiale du token", 100_000, 100_000_000, 1_000_000, 100_000)
-
-    with st.expander("Stress Test"):
-        do_stress_test = st.checkbox("Activer un choc de marché ?")
-        shock_day = st.slider("Jour du choc", 1, days, 15)
-        shock_factor = st.slider("Facteur multiplicatif du volume", 0.1, 2.0, 0.5, 0.05)
-        st.write("**Exemple** : 0.5 => -50% du volume, 1.5 => +50% du volume...")
-
-    st.write("---")
-
-    st.write("### Comparaison Automatique S1 vs S2")
-    if st.button("Simuler S1 & S2"):
-        # On simule S1
-        df_s1 = simulate_fees_scenario(
-            volume_start=volume_journalier,
-            days=days,
-            daily_growth=daily_growth,
-            scenario='S1',
-            do_stress_test=do_stress_test,
-            shock_day=shock_day,
-            shock_factor=shock_factor,
-            supply_start=supply_start,
-            elasticity=elasticity
-        )
-        # On simule S2
-        df_s2 = simulate_fees_scenario(
-            volume_start=volume_journalier,
-            days=days,
-            daily_growth=daily_growth,
-            scenario='S2',
-            do_stress_test=do_stress_test,
-            shock_day=shock_day,
-            shock_factor=shock_factor,
-            supply_start=supply_start,
-            elasticity=elasticity
-        )
-
-        # On peut concaténer pour faciliter la visualisation
-        df_s1['scenario'] = 'S1'
-        df_s2['scenario'] = 'S2'
-        df_all = pd.concat([df_s1, df_s2], ignore_index=True)
-
-        st.subheader("Aperçu des données")
-        st.dataframe(df_all.head(20))
-
-        # Graph - Comparaison Burn / scenario
-        fig_burn_compare = px.line(
-            df_all,
-            x='day',
-            y='burn_usd',
+        # Graph
+        fig_burn = px.line(
+            df_merged,
+            x='day', 
+            y='burn_rbot_usd', 
             color='scenario',
-            title="Comparaison du Burn (USD) jour par jour",
-            labels={"day": "Jour", "burn_usd": "Burn (USD)"}
+            title="Burn (USD) over time"
         )
-        st.plotly_chart(fig_burn_compare, use_container_width=True)
+        st.plotly_chart(fig_burn, use_container_width=True)
 
-        # Graph - supply
-        fig_supply_compare = px.line(
-            df_all,
+        fig_price = px.line(
+            df_merged,
             x='day',
-            y='supply',
+            y='rbot_price',
             color='scenario',
-            title="Comparaison de la Supply Tokens",
-            labels={"day": "Jour", "supply": "Supply"}
+            title="RBOT Price over time"
         )
-        st.plotly_chart(fig_supply_compare, use_container_width=True)
+        st.plotly_chart(fig_price, use_container_width=True)
 
-        # Calcul cumul
-        df_grouped = df_all.groupby('scenario').agg({
-            'burn_usd': 'sum',
-            'treasury_usd': 'sum',
-            'liquidity_usd': 'sum',
-            'price_token': 'last',
-            'supply': 'last'
+        fig_supply = px.line(
+            df_merged,
+            x='day',
+            y='rbot_supply',
+            color='scenario',
+            title="RBOT Supply over time"
+        )
+        st.plotly_chart(fig_supply, use_container_width=True)
+
+        # Group
+        final_stats = df_merged.groupby('scenario').agg({
+            'rbot_price': 'last',
+            'rbot_supply': 'last',
+            'burn_rbot_tokens': 'sum',
+            'bc_liquidity_usd': 'sum',
+            'trading_pool_usd': 'sum',
+            'treasury_usd': 'sum'
         }).rename(columns={
-            'burn_usd': 'Burn Total',
-            'treasury_usd': 'Trésorerie Totale',
-            'liquidity_usd': 'Liquidité Totale',
-            'price_token': 'Prix Final (approx)',
-            'supply': 'Supply Finale'
+            'rbot_price': 'RBOT_Price_Final',
+            'rbot_supply': 'RBOT_Supply_Final',
+            'burn_rbot_tokens': 'Burned_RBOT_Tokens_Cumul',
+            'bc_liquidity_usd': 'BC_Liq_Cumul',
+            'trading_pool_usd': 'TradingPool_Cumul',
+            'treasury_usd': 'Treasury_Cumul'
         })
-        st.subheader("Synthèse par Scénario")
-        st.dataframe(df_grouped)
 
-        st.write("**Analyse :**")
-        st.write("- On peut voir le total du Burn, la Trésorerie, la Liquidité, etc. sur la période.")
-        st.write("- Le prix final et la supply finale (simplement d'après notre petit modèle d'élasticité).")
-
+        st.write("### Final Stats")
+        st.dataframe(final_stats)
 
 def main():
-    st.title("Simulateur Avancé de Répartition des Fees & Tokenomics")
-    st.sidebar.title("Navigation")
-    mode = st.sidebar.radio("Choisissez un mode", ["Basique", "Avancé"])
-
-    if mode == "Basique":
-        show_basic_mode()
-    else:
-        show_advanced_mode()
-
+    page_app()
 
 if __name__ == "__main__":
     main()
