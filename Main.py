@@ -3,36 +3,34 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
-# =========================
-#    LOGIQUE / MODEL
-# =========================
+#=============================
+#    LOGIC / MODEL
+#=============================
 
 def bonding_curve_rbot_for_tokens(m_before, m_after, p0, f):
     """
-    Exponentielle :
+    Bonding Curve exponentielle simplifiée:
     B(m,n) = p0 * (f^n - f^m) / (f - 1)
-    m_before = old AiToken supply
-    m_after  = new AiToken supply
-    p0,f = params Bonding Curve
-    Retourne la quantité (positive => besoin en $RBOT si on achète,
-                           négative => on récupère du RBOT si on vend).
+    Retourne la quantité (positive => RBOT requis pour buy,
+                           négative => RBOT remboursé si sell).
     """
     if abs(f - 1.0) < 1e-9:
-        # Cas f ~= 1 => prix constant
         return p0 * (m_after - m_before)
     return p0 * ((f**m_after) - (f**m_before)) / (f - 1)
 
-
-def simulate_protocol(
+def simulate_scenario(
     scenario_name,
-    # Param généraux
-    total_periods,       # nombre total (jour ou mois)
-    time_unit,           # "Days" ou "Months"
-    nb_agents,           # juste un param contextuel (int)
-    # Bonding curve
-    p0,                  # prix initial
-    f,                   # facteur exponentiel
-    # Secondary market
+    # Paramètre de temps
+    total_periods,
+    time_unit,
+    # Paramètre RBOT init + vesting
+    init_rbot_price,
+    init_rbot_supply,
+    vesting_df,
+    # Bonding Curve
+    p0,
+    f,
+    # Secondary Market
     secondary_market_start,
     portion_secondary_after,
     # Fees
@@ -42,38 +40,36 @@ def simulate_protocol(
     treasury_funding_objective_musd_year,
     stakeholders_yearly_sales_percent,
     stakers_lock_months,
-    # Table transactions (edité)
+    # Table transactions
     transactions_df,
-    # Table vesting (RBOT)
-    vesting_df,
-    # Param init RBOT
-    init_rbot_price,
-    init_rbot_supply,
     # Divers
-    elasticity_price=0.5
+    scenario_id=1, 
 ):
     """
-    Simulation "avancée" :
-    - Sur la période 1..total_periods (unit=jour/mois),
-    - Bonding curve + secondary market (activé après 'secondary_market_start'),
-    - Ajout de fees (protocol, treasury),
-    - Comportements utilisateurs (vente % par an => on répartit par mois),
-    - Vesting / unlock de RBOT,
-    - Mise à jour du prix RBOT et supply.
-
-    Retourne un DataFrame (une ligne par période).
+    Simulation unifiée.
+    - total_periods: par ex. 48 (mois sur 4 ans) ou 365 (jours)
+    - time_unit: "Days", "Months"
+    - init_rbot_price, init_rbot_supply: État initial du token RBOT
+    - vesting_df: table vesting RBOT
+    - p0,f => Bonding curve
+    - secondary_market_start => après X periods on active un portion vers le secondary
+    - portion_secondary_after => fraction du volume qu’on route sur le secondary
+    - fees => protocol, treasury
+    - treasury_funding_objective_musd_year => ventes mensuelles / journalières
+    - stakeholders_yearly_sales_percent => part vendue par an
+    - stakers_lock_months => on peut en tenir compte si on veut bloquer la vente d’une fraction
+    - transactions_df => volumes buy/sell édités (colonnes: period, buy_ai, sell_ai)
+    - scenario_id => identifiant pour tracer plus tard
     """
 
-    # Conversions si needed
-    # ex. treasury_funding_objective_musd_year => mensuel
-    # Si time_unit = "Months", on divise par 12. S'il s'agit de Days, par 365.
+    # Conversion year->period
     if time_unit == "Months":
         periods_in_year = 12
     else:
         periods_in_year = 365
 
     monthly_funding_needed = (treasury_funding_objective_musd_year * 1_000_000) / periods_in_year
-    # On transfère en "par période"
+    stakeholder_sell_rate = (stakeholders_yearly_sales_percent / 100.0) / periods_in_year
 
     # État initial
     rbot_price = init_rbot_price
@@ -81,108 +77,77 @@ def simulate_protocol(
     ai_token_circ = 0.0
 
     protocol_fees_usd = 0.0
-    treasury_balance_usd = 0.0
+    treasury_usd = 0.0
+
+    # Mapping transactions
+    tx_map = {}
+    for _, row in transactions_df.iterrows():
+        key = int(row['period'])
+        buy_ = row.get('buy_ai', 0.0)
+        sell_ = row.get('sell_ai', 0.0)
+        tx_map[key] = (buy_, sell_)
+
+    # Mapping vesting
+    vest_map = {}
+    for _, vrow in vesting_df.iterrows():
+        t_v = int(vrow['period'])
+        unlocked = float(vrow['unlocked'])
+        vest_map[t_v] = vest_map.get(t_v, 0.0) + unlocked
 
     records = []
-
-    # Pour simplifier, le ratio annual => period pour la vente:
-    # ex. 10% an => ~0.10/12 par mois ou 0.10/365 par jour
-    stakeholder_sell_rate = (stakeholders_yearly_sales_percent / 100.0) / periods_in_year
-
-    # On prépare un accès direct par (period -> row) pour transactions
-    # Suppose transactions_df a 'period' comme colonne
-    transactions_map = {}
-    for _, row in transactions_df.iterrows():
-        key = row['period']
-        buy_ai = row.get('buy_ai', 0.0)
-        sell_ai = row.get('sell_ai', 0.0)
-        transactions_map[int(key)] = (buy_ai, sell_ai)
-
-    # Idem pour vesting (month, unlocked)
-    vesting_map = {}
-    for _, rowv in vesting_df.iterrows():
-        vtime = int(rowv['period'])
-        vunlocked = rowv['unlocked']
-        if vtime not in vesting_map:
-            vesting_map[vtime] = 0.0
-        vesting_map[vtime] += vunlocked
-
-    # Boucle de simulation
     for t in range(1, total_periods+1):
-        # 1) Vesting (RBOT)
-        unlocked_today = vesting_map.get(t, 0.0)
-        old_supply = rbot_supply
-        rbot_supply += unlocked_today  # + tokens sur le marché => pression
-        # On modélise un petit effet prix si on veut (voir plus bas)
+        # 1) Vesting RBOT
+        unlocked_today = vest_map.get(t, 0.0)
+        rbot_supply += unlocked_today  # Pressure sur le prix
 
-        # 2) Lecture volume buy/sell depuis transactions_df
-        buy_ai = 0.0
-        sell_ai = 0.0
-        if t in transactions_map:
-            buy_ai, sell_ai = transactions_map[t]
+        # 2) Transactions (buy/sell AiToken)
+        buy_ai, sell_ai = tx_map.get(t, (0.0, 0.0))
 
-        # 3) Stakeholders sales => ex. stakeholder_sell_rate * ai_token_circ
-        additional_sell = stakeholder_sell_rate * ai_token_circ
-        sell_ai += additional_sell
+        # 3) Stakeholders sales => ex. 0.XX % du AiToken circ => +sell
+        stakeholder_extra = stakeholder_sell_rate * ai_token_circ
+        sell_ai += stakeholder_extra
 
-        # 4) Treasury funding => on simule qu'on vend AiToken ou on vend RBOT ?
-        #   Ex.: On vend AiToken pour lever monthly_funding_needed => simplifié
-        #   => convert (AiToken) -> $ ? On l'ajoute au sell_ai ?
-        #   On fait un "TODO": c'est un exemple
-        #   On suppose 1 AiToken = 1$ pour la démo, ou on calcule un prix ?
-        #   Pour aller vite, on skip l'intégration dans le BC. Cf. la suite.
-        #   (Tu peux l'implémenter selon ta logique.)
-        # ...
+        # 4) Treasury funding => on pourrait simuler la vente d’AiToken ou RBOT
+        #    pour lever monthly_funding_needed => skip pour simplifier
+        #    ou l’ajouter à la dimension "sell_ai" etc.
 
-        # 5) Si t < secondary_market_start => 100% sur BC
-        #    Sinon => portion X sur BC, portion (1-X) sur secondary
+        # 5) Secondary vs BC
         portion_bc = 1.0
         portion_sc = 0.0
         if t >= secondary_market_start:
-            portion_bc = 1.0 - portion_secondary_after
             portion_sc = portion_secondary_after
+            portion_bc = 1.0 - portion_sc
 
         bc_buy = buy_ai * portion_bc
         bc_sell = sell_ai * portion_bc
         sc_buy = buy_ai * portion_sc
         sc_sell = sell_ai * portion_sc
 
-        # 6) Calcul sur Bonding Curve
-        net_bc = bc_buy - bc_sell
+        # 6) Bonding Curve
         old_ai = ai_token_circ
+        net_bc = bc_buy - bc_sell
         new_ai = old_ai + net_bc
         if new_ai < 0:
             new_ai = 0
-        # Montant RBOT $ requis
+
+        # Montant RBOT $
         rbot_bc = bonding_curve_rbot_for_tokens(old_ai, new_ai, p0, f)
-
-        # Si rbot_bc>0 => on consomme du $ => prise en compte des fees
         cost_usd = max(0, rbot_bc)
-        # Fees
-        protoc_fee = cost_usd * (protocol_fee_percent / 100.0)
-        treas_fee = cost_usd * (treasury_fee_percent / 100.0)
+        protoc_fee = cost_usd * (protocol_fee_percent/100.0)
+        treas_fee = cost_usd * (treasury_fee_percent/100.0)
         protocol_fees_usd += protoc_fee
-        treasury_balance_usd += treas_fee
+        treasury_usd += treas_fee
 
-        # maj circ
         ai_token_circ = new_ai
 
-        # 7) Secondary Market (placeholder)
-        # sc_buy, sc_sell => on ne calcule pas le slippage exact
-        # on peut juste logger
-        # On pourrait imaginer un "rbot_sc" +/- si on implémente un AMM
-
-        # 8) Update rbot_price (effet supply + rbot_bc)
-        # ex. delta = (rbot_bc / 10000) - (unlocked_today / 20000)
-        # ou usage d'elasticsearch
+        # 7) Update rbot_price (ex. toy model)
+        #    On imagine un delta corrélé à rbot_bc + vesting
         delta_price = (rbot_bc / 10000.0) - (unlocked_today / 20000.0)
         rbot_price = max(0.000001, rbot_price + delta_price)
 
-        # on peut imaginer un second effet si ai_token_circ bouge, etc.
-
-        # 9) Stocker
         records.append({
-            'scenario': scenario_name,
+            'scenario_id': scenario_id,
+            'scenario_name': scenario_name,
             time_unit: t,
             'Unlocked_RBOT': unlocked_today,
             'RBOT_Supply': rbot_supply,
@@ -190,145 +155,211 @@ def simulate_protocol(
             'AiToken_Circ': ai_token_circ,
             'Buy_BC': bc_buy,
             'Sell_BC': bc_sell,
-            'RBOT_BC_Used': rbot_bc,
-            'Protocol_Fees_USD': protocol_fees_usd,
-            'Treasury_USD': treasury_balance_usd,
             'Secondary_Buy': sc_buy,
-            'Secondary_Sell': sc_sell
+            'Secondary_Sell': sc_sell,
+            'RBOT_BC_Amount': rbot_bc,
+            'Protocol_Fees_USD': protocol_fees_usd,
+            'Treasury_USD': treasury_usd
         })
 
     return pd.DataFrame(records)
 
+#=============================
+#    STREAMLIT APP (UI)
+#=============================
 
-# =========================
-#   STREAMLIT UI
-# =========================
+def page_app():
+    # Titre + style
+    st.title("⚙️ Advanced Tokenomics Simulator")
 
-def app():
-    st.title("Simulation : Bonding Curve, Secondary Market, Vesting, Protocol Fees, etc.")
+    # Barre latérale (verticale)
+    st.sidebar.title("Configuration Globale")
+    # Nombre de scénarios
+    n_scenarios = st.sidebar.number_input("Number of Scenarios", 1, 5, 1)
 
-    # 1) Scénario
-    scenario_name = st.text_input("Scenario Name", "Scenario_1")
+    # On va stocker les param de scénarios
+    scenarios_params = []
+    for i in range(n_scenarios):
+        with st.sidebar.expander(f"Scenario {i+1}"):
+            scenario_name = st.text_input(f"Scenario Name {i+1}", value=f"Scen_{i+1}")
+            time_unit = st.selectbox(f"Time Unit (Scen {i+1})", ["Days","Months"], index=1, key=f"tu_{i}")
+            total_periods = st.number_input(f"Total {time_unit} to simulate (S{i+1})", 1, 5000, 36, key=f"tp_{i}")
 
-    # 2) Time unit
-    time_unit = st.radio("Time Unit", ["Days", "Months"], index=1)
+            st.subheader("Token RBOT Init & Vesting")
+            init_rbot_price = st.number_input(f"Initial RBOT Price (S{i+1})", 0.000001, 100000.0, 1.0, key=f"rprice_{i}")
+            init_rbot_supply = st.number_input(f"Initial RBOT Supply (S{i+1})", 0.0, 1e9, 1_000_000.0, key=f"rsup_{i}")
 
-    # 3) Nombre total de périodes
-    total_periods = st.number_input(f"Total {time_unit} to simulate", 1, 5000, 36)
+            st.subheader("Bonding Curve")
+            p0 = st.number_input(f"p0 (S{i+1})", 0.000001, 1_000.0, 1.0, key=f"p0_{i}")
+            f_ = st.number_input(f"f factor (S{i+1})", 0.9999, 2.0, 1.0001, 0.0001, key=f"f_{i}")
 
-    # 4) nb_agents (int)
-    nb_agents = st.number_input("Number of AI Agents (int)", 0, 1000000, 10, step=1)
+            st.subheader("Secondary Market")
+            secondary_market_start = st.number_input(f"Enable SM after X {time_unit}", 1, 9999, 12, key=f"ss_{i}")
+            portion_sc = st.slider(f"Portion to Secondary (S{i+1})", 0.0, 1.0, 0.5, 0.1, key=f"psc_{i}")
 
-    # Bonding curve
-    st.subheader("Bonding Curve Params")
-    p0 = st.number_input("p0 (initial price for 1st token)", 0.000001, 1000.0, 1.0, 0.1)
-    f = st.number_input("f (exponent factor)", 0.9999, 2.0, 1.0001, 0.0001)
+            st.subheader("Protocol & Treasury Fees (%)")
+            proto_fee = st.slider(f"Protocol Fee (S{i+1})", 0.0, 10.0, 1.0, 0.1, key=f"pfe_{i}")
+            treas_fee = st.slider(f"Treasury Fee (S{i+1})", 0.0, 10.0, 1.0, 0.1, key=f"tre_{i}")
 
-    # Secondary Market
-    st.subheader("Secondary Market")
-    secondary_market_start = st.number_input(f"Enable Secondary Market after X {time_unit}", 1, 9999, 12)
-    portion_secondary_after = st.slider("Fraction going to Secondary once active", 0.0, 1.0, 0.5, 0.1)
+            st.subheader("User Behaviors")
+            tf_obj = st.number_input(f"Treasury Funding Objective M$/year (S{i+1})", 0.0, 1e3, 10.0, key=f"tfm_{i}")
+            stake_sales = st.slider(f"Stakeholders yearly sales % (S{i+1})", 0.0, 100.0, 10.0, key=f"stak_{i}")
+            lock_m = st.number_input(f"Stakers Lock {time_unit} (S{i+1})", 0, 60, 12, key=f"lock_{i}")
 
-    # Fees
-    st.subheader("Protocol / Treasury Fees (%)")
-    protocol_fee_percent = st.slider("Protocol Fee %", 0.0, 10.0, 1.0, 0.1)
-    treasury_fee_percent = st.slider("Treasury Fee %", 0.0, 10.0, 1.0, 0.1)
-
-    # Behaviors
-    st.subheader("Users Behaviors / Funding")
-    treasury_funding_objective_musd_year = st.number_input("Treasury Funding Objective (M$ / year)", 0.0, 1000.0, 10.0)
-    stakeholders_yearly_sales_percent = st.slider("Stakeholders yearly sales (%)", 0.0, 100.0, 10.0, 1.0)
-    stakers_lock_months = st.number_input("Stakers average lock time", 0, 60, 12)
-
-    # RBOT init
-    st.subheader("RBOT Initial State")
-    init_rbot_price = st.number_input("Initial RBOT Price ($)", 0.000001, 100000.0, 1.0)
-    init_rbot_supply = st.number_input("Initial RBOT Supply", 0.0, 1e9, 1_000_000.0, 100_000.0)
+            scenarios_params.append({
+                'scenario_id': i+1,
+                'scenario_name': scenario_name,
+                'time_unit': time_unit,
+                'total_periods': int(total_periods),
+                'init_rbot_price': float(init_rbot_price),
+                'init_rbot_supply': float(init_rbot_supply),
+                'p0': float(p0),
+                'f': float(f_),
+                'secondary_market_start': int(secondary_market_start),
+                'portion_secondary_after': float(portion_sc),
+                'protocol_fee_percent': float(proto_fee),
+                'treasury_fee_percent': float(treas_fee),
+                'treasury_funding_objective_musd_year': float(tf_obj),
+                'stakeholders_yearly_sales_percent': float(stake_sales),
+                'stakers_lock_months': int(lock_m),
+            })
 
     st.write("---")
-
-    # Table Transactions
     st.subheader("Monthly (or Daily) Transactions Table")
-    # Par défaut, on crée un DF "period, buy_ai, sell_ai"
+    maxT = max(sp['total_periods'] for sp in scenarios_params)
+    # On crée un DF "period, buy_ai, sell_ai"
     default_data = {
-        'period': list(range(1, total_periods+1)),
-        'buy_ai': [0.0]*total_periods,
-        'sell_ai': [0.0]*total_periods
+        'period': list(range(1, maxT+1)),
+        'buy_ai': [0.0]*maxT,
+        'sell_ai': [0.0]*maxT
     }
-    transactions_init = pd.DataFrame(default_data)
-    st.markdown("Modifiez directement les colonnes `buy_ai` / `sell_ai` si besoin.")
-    edited_transactions = st.data_editor(transactions_init, key="transaction_editor")
+    tx_init_df = pd.DataFrame(default_data)
+    st.markdown("Feel free to edit buy/sell volumes for each period.")
+    edited_tx_df = st.data_editor(tx_init_df, key="editor_tx")
 
-    # Vesting
-    st.subheader("RBOT Vesting / Unlock Table")
-    vesting_init = pd.DataFrame({'period': [12, 24], 'unlocked': [50000, 100000]})
-    st.markdown("Ajoutez ou modifiez les lignes pour décrire le vesting RBOT.")
-    edited_vesting = st.data_editor(vesting_init, key="vesting_editor")
+    st.subheader("Vesting Table for RBOT")
+    vest_init_df = pd.DataFrame({'period': [12,24,36], 'unlocked': [50000,100000,200000]})
+    st.markdown("Add or adjust lines for TGE, Team vesting, etc.")
+    edited_vest_df = st.data_editor(vest_init_df, key="editor_vest")
 
+    # Bouton
     if st.button("Run Simulation"):
-        df_result = simulate_protocol(
-            scenario_name=scenario_name,
-            total_periods=int(total_periods),
-            time_unit=time_unit,
-            nb_agents=int(nb_agents),
-            p0=p0,
-            f=f,
-            secondary_market_start=secondary_market_start,
-            portion_secondary_after=portion_secondary_after,
-            protocol_fee_percent=protocol_fee_percent,
-            treasury_fee_percent=treasury_fee_percent,
-            treasury_funding_objective_musd_year=treasury_funding_objective_musd_year,
-            stakeholders_yearly_sales_percent=stakeholders_yearly_sales_percent,
-            stakers_lock_months=stakers_lock_months,
-            transactions_df=edited_transactions,
-            vesting_df=edited_vesting,
-            init_rbot_price=init_rbot_price,
-            init_rbot_supply=init_rbot_supply
+        st.success("Simulation in progress...")
+
+        all_results = []
+        for sp in scenarios_params:
+            # Tronquer les tables aux "total_periods"
+            sub_tx = edited_tx_df[ edited_tx_df['period'] <= sp['total_periods'] ]
+            sub_vest = edited_vest_df[ edited_vest_df['period'] <= sp['total_periods'] ]
+
+            df_res = simulate_scenario(
+                scenario_name=sp['scenario_name'],
+                total_periods=sp['total_periods'],
+                time_unit=sp['time_unit'],
+                init_rbot_price=sp['init_rbot_price'],
+                init_rbot_supply=sp['init_rbot_supply'],
+                vesting_df=sub_vest,
+                p0=sp['p0'],
+                f=sp['f'],
+                secondary_market_start=sp['secondary_market_start'],
+                portion_secondary_after=sp['portion_secondary_after'],
+                protocol_fee_percent=sp['protocol_fee_percent'],
+                treasury_fee_percent=sp['treasury_fee_percent'],
+                treasury_funding_objective_musd_year=sp['treasury_funding_objective_musd_year'],
+                stakeholders_yearly_sales_percent=sp['stakeholders_yearly_sales_percent'],
+                stakers_lock_months=sp['stakers_lock_months'],
+                transactions_df=sub_tx,
+                scenario_id=sp['scenario_id']
+            )
+            all_results.append(df_res)
+
+        df_merged = pd.concat(all_results, ignore_index=True)
+
+        st.write("### Simulation Results (All Scenarios)")
+        st.dataframe(df_merged.head(1000))
+
+        # On s’inspire de tes UI exemples pour tracer divers graphes
+
+        # 1) Token Price & Market Cap
+        # On simule un "market cap" = RBOT_Price * RBOT_Supply (toy model)
+        df_merged['MarketCap_USD'] = df_merged['RBOT_Price'] * df_merged['RBOT_Supply']
+        # On peut imaginer un FDV = Price * total supply max. 
+        # Pour la démo, FDV ~ Price*(init supply+some big supply)
+        df_merged['FDV'] = df_merged['RBOT_Price'] * (df_merged['RBOT_Supply'].max())
+
+        time_col = df_merged.columns[2]  # "Days" ou "Months"
+
+        fig_token_mcap = px.line(
+            df_merged,
+            x=time_col,
+            y=['RBOT_Price','MarketCap_USD','FDV'],
+            color='scenario_name',
+            title="Token Price & Market Cap"
         )
+        st.plotly_chart(fig_token_mcap, use_container_width=True)
 
-        st.write("## Résultats de la Simulation")
-        st.dataframe(df_result.head(2000))  # ou st.dataframe(df_result) selon la taille
+        # 2) Token Buying & Selling Dynamics
+        # net = (Buy_BC + Secondary_Buy) - (Sell_BC + Secondary_Sell)
+        df_merged['Total_Buy'] = df_merged['Buy_BC'] + df_merged['Secondary_Buy']
+        df_merged['Total_Sell'] = df_merged['Sell_BC'] + df_merged['Secondary_Sell']
+        df_merged['Net_Buy_Sell'] = df_merged['Total_Buy'] - df_merged['Total_Sell']
 
-        # Graph : Buy / Sell BC
-        fig_buy_sell = px.bar(
-            df_result,
-            x=df_result.columns[1],  # day/month axis
-            y=["Buy_BC","Sell_BC"],
-            title="Dynamics of Buy vs Sell on Bonding Curve",
-            barmode="group"
+        fig_dynamics = px.area(
+            df_merged,
+            x=time_col,
+            y=['Total_Buy','Total_Sell','Net_Buy_Sell'],
+            color='scenario_name',
+            title="Token Buying & Selling Dynamics"
         )
-        st.plotly_chart(fig_buy_sell, use_container_width=True)
+        st.plotly_chart(fig_dynamics, use_container_width=True)
 
-        # Graph : RBOT Price
-        fig_price = px.line(
-            df_result,
-            x=df_result.columns[1],
-            y="RBOT_Price",
-            title="RBOT Price Evolution"
+        # 3) Token Supply 
+        # On a "AiToken_Circ" -> st.plot
+        fig_supply = px.line(
+            df_merged,
+            x=time_col,
+            y=['RBOT_Supply','AiToken_Circ'],
+            color='scenario_name',
+            title="Token Supply (RBOT) vs AiToken in Circulation"
         )
-        st.plotly_chart(fig_price, use_container_width=True)
+        st.plotly_chart(fig_supply, use_container_width=True)
 
-        # Graph : Protocol Fees & Treasury
-        fig_fees = px.line(
-            df_result,
-            x=df_result.columns[1],
-            y=["Protocol_Fees_USD","Treasury_USD"],
-            title="Protocol Fees & Treasury Balance (USD)"
+        # 4) Annualized inflation (toy)
+        # ex. yoy inflation = difference ratio
+        # On peut calculer un yoy glissant, mais c'est plus complexe
+        # On fait un simple ratio: inflation[t] = (Supply[t] - Supply[t-12]) / Supply[t-12]
+        df_merged['Inflation'] = 0.0
+        # Skipping real yoy approach for time
+        # ...
+        fig_inflation = px.line(
+            df_merged,
+            x=time_col,
+            y='Inflation',
+            color='scenario_name',
+            title="Annualized YoY Inflation (toy example)"
+        )
+        st.plotly_chart(fig_inflation, use_container_width=True)
+
+        # 5) Staked Tokens (optionnel)
+        # Cf. user can interpret stakers_lock, etc. - skipping actual modeling
+        # ...
+
+        # 6) Protocol Fees, Treasury
+        fig_fees = px.area(
+            df_merged,
+            x=time_col,
+            y=['Protocol_Fees_USD','Treasury_USD'],
+            color='scenario_name',
+            title="Protocol Fees & Treasury PnL"
         )
         st.plotly_chart(fig_fees, use_container_width=True)
 
-        # Graph : AiToken in circulation
-        fig_ai = px.line(
-            df_result,
-            x=df_result.columns[1],
-            y="AiToken_Circ",
-            title="AiToken in Circulation"
-        )
-        st.plotly_chart(fig_ai, use_container_width=True)
+        st.write("Simulation Completed ✔️")
 
 
 def main():
-    app()
+    page_app()
 
-if __name__ == "__main__":
+
+if __name__=="__main__":
     main()
