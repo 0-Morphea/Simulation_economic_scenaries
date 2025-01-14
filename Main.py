@@ -3,27 +3,16 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
-# =======================
-#   MODULE : VESTING
-# =======================
+# ============================
+#     VESTING MODULE
+# ============================
 def compute_vesting_schedule(vesting_alloc_df, total_periods, time_unit):
     """
-    Calcule, pour chaque période 1..total_periods, la quantité de tokens
-    débloqués (=circ_supply) selon la table d'allocation/vesting.
-
-    vesting_alloc_df columns:
-      - 'allocation_name'
-      - 'total_tokens'
-      - 'tge_percent'
-      - 'lock_period'
-      - 'vesting_period'
-    On suppose un unlock TGE% à t=1,
-    puis linéaire sur 'vesting_period' après 'lock_period'.
+    Calcule la supply circulante par période selon la table d'allocation/vesting.
     """
     cat_list = vesting_alloc_df['allocation_name'].unique()
     max_t = total_periods
 
-    # unlocks[cat][t] = tokens libérés à la période t
     unlocks = {}
     for cat in cat_list:
         unlocks[cat] = np.zeros(max_t+1)  # index 1..max_t
@@ -35,394 +24,261 @@ def compute_vesting_schedule(vesting_alloc_df, total_periods, time_unit):
         lock_p = int(row['lock_period'])
         vest_p = int(row['vesting_period'])
 
-        # TGE
-        tge_amount = total_tokens*tge_percent
+        tge_amount = total_tokens * tge_percent
         locked_amount = total_tokens - tge_amount
-        if 1<=max_t:
+
+        # TGE => t=1
+        if 1 <= max_t:
             unlocks[cat][1] += tge_amount
-        # linéaire vesting
-        if vest_p>0 and locked_amount>0:
+
+        if vest_p > 0:
             monthly_unlocked = locked_amount/vest_p
             start_vest = lock_p+1
             end_vest = lock_p+vest_p
             for t in range(start_vest, end_vest+1):
                 if t<=max_t:
-                    unlocks[cat][t]+=monthly_unlocked
+                    unlocks[cat][t] += monthly_unlocked
 
-    # cumul par cat
-    supply_cat = {}
+    supply_each_cat = {}
     for cat in cat_list:
         cumsum_cat = np.cumsum(unlocks[cat])
-        supply_cat[cat] = cumsum_cat
+        supply_each_cat[cat] = cumsum_cat
 
-    # somme
     total_supply = np.zeros(max_t+1)
     for cat in cat_list:
-        total_supply += supply_cat[cat]
+        total_supply += supply_each_cat[cat]
 
     df_supply = pd.DataFrame({
-        'period': range(1,max_t+1),
+        'period': range(1, max_t+1),
         'circ_supply': total_supply[1:]
     })
     return df_supply
 
 
-# =======================
-#  HELPER : AMM / BC
-# =======================
-def amm_buy_sc_tokens(buy_tokens, pool_rbot, pool_ai, invariant_k):
-    """L'utilisateur veut ACQUÉRIR 'buy_tokens' AiTokens sur l'AMM (x*y=k).
-       Retourne (rbot_in, new_pool_rbot, new_pool_ai, slippage, price_before, price_after).
+# ============================
+#   FEES & BURN MODULE
+# ============================
+def distribute_fees(volume_usd, burn_ratio, liquidity_ratio, treasury_ratio, price_token):
     """
-    if buy_tokens<=0 or pool_ai<=0:
-        return (0.0, pool_rbot, pool_ai,0.0,None,None)
-    old_price = (pool_rbot/pool_ai) if pool_ai>0 else 1e9
-
-    new_pool_ai = pool_ai - buy_tokens
-    if new_pool_ai<1e-9:
-        buy_tokens=pool_ai
-        new_pool_ai=1e-9
-    new_pool_rbot = invariant_k/new_pool_ai
-    rbot_in = new_pool_rbot - pool_rbot
-    new_price = new_pool_rbot/new_pool_ai
-    slip=(new_price-old_price)/old_price if old_price>0 else 0
-    return (rbot_in, new_pool_rbot, new_pool_ai, slip, old_price, new_price)
-
-def amm_sell_sc_tokens(sell_tokens, pool_rbot, pool_ai, invariant_k):
-    """L'utilisateur VEUT VENDRE 'sell_tokens' AiTokens.
-       Retourne (rbot_out,new_pool_rbot,new_pool_ai,slip,price_before,price_after).
+    volume_usd => le volume subissant 1% de fees
+    burn_ratio + liqu_ratio + treas_ratio = 1.0 (somme <= 1)
+    price_token => pour convertir burn_usd -> burn_tokens
+    Retourne: burn_usd, burn_tokens, liquidity_usd, treasury_usd
     """
-    if sell_tokens<=0 or pool_ai<=0:
-        return(0.0,pool_rbot,pool_ai,0.0,None,None)
-    old_price=(pool_rbot/pool_ai) if pool_ai>0 else 1e9
-
-    new_pool_ai = pool_ai+sell_tokens
-    new_pool_rbot = invariant_k/new_pool_ai
-    rbot_out = pool_rbot-new_pool_rbot
-    new_price = new_pool_rbot/new_pool_ai
-    slip=(new_price-old_price)/old_price if old_price>0 else 0
-    return (rbot_out,new_pool_rbot,new_pool_ai,slip,old_price,new_price)
-
-def bonding_curve_rbot_for_tokens(m_before, m_after, p0, f):
-    """
-    B(m,n) = p0*(f^n - f^m)/(f-1)
-    Montant ($) requis (positif) ou rendu (négatif) selon buy/sell sur BC.
-    """
-    if abs(f-1.0)<1e-9:
-        return p0*(m_after-m_before)
-    return p0*((f**m_after)-(f**m_before))/(f-1)
+    fee_1pct = volume_usd*0.01
+    burn_usd = fee_1pct*burn_ratio
+    liqu_usd = fee_1pct*liquidity_ratio
+    treas_usd = fee_1pct*treasury_ratio
+    burn_tokens = 0.0
+    if price_token>0:
+        burn_tokens = burn_usd/price_token
+    return burn_usd, burn_tokens, liqu_usd, treas_usd
 
 
-# =======================
-#  MAIN SIMULATION
-# =======================
+# ============================
+#   SIMULATION
+# ============================
 def simulate_scenario(
     scenario_name, scenario_id,
     total_periods,
     time_unit,
-    # vesting supply
-    df_vest,
-    # volume + growth
-    init_volume_usd, growth_percent,
-    # fees (burn/liqu/treasury)
-    burn_ratio, liqu_ratio, treas_ratio,
-    # BC + AMM
-    p0, f,
-    bc_liquidity_threshold, pool_percentage,
-    secondary_market_start,
-    portion_secondary_after
+    # supply from vesting
+    df_vest_supply,  # columns: period, circ_supply
+    # volume & growth
+    init_volume_usd,
+    growth_percent,
+    # fees distribution
+    burn_ratio,
+    liquidity_ratio,
+    treasury_ratio,
+    # to keep it short, we skip BC/AMM logic here, but you can re-insert them
 ):
     """
-    On simule, par période:
-      - On lit la supply circ: m_current <= circ
-      - On applique un volume => (ex. 'buy_ai','sell_ai' => simplifié)
-      - 1% fee => burn, liqu, treasury => burn => tokens out => effet prix
-      - BC => minted AiToken => bc liquidity => si surpass threshold => AMM
-      - portion SC => on calcule slippage (toy).
+    Ex: On simule un volume de trading en $ qui grandit de growth_percent % par période,
+    On applique 1% fees => burn, liqu, treasury. On calcule le burn nominal et
+    on retire les tokens => impact sur supply => impact sur price (toy).
     """
-    # Simplifions la partie "transactions" => On utilise un "volume" qu'on convertit en AiTokens ?
-    # pour avoir la BC minted => on fera un 'net_buy' = volume / prix ? => etc.
-    # Code d'exemple (toy)...
+    records = []
+    supply_current = 0.0
+    if not df_vest_supply.empty:
+        supply_current = float(df_vest_supply.iloc[0]['circ_supply'])
 
-    # On map vest df
-    vest_map = {int(r['period']): float(r['circ_supply']) for _,r in df_vest.iterrows()}
-
-    # BC
-    bc_liquidity_usd=0.0
-    secondary_active=False
-    pool_rbot=0.0
-    pool_ai=0.0
-    invariant_k=0.0
-
-    m_current=0.0  # minted via BC
-    price_token=1.0
-    protocol_usd=0.0
-    treasury_usd=0.0
+    # On suppose un prix initial
+    price_token = 1.0
 
     volume = init_volume_usd
+    volume_list = []
 
-    records=[]
-    for t in range(1, total_periods+1):
-        # supply circ max
-        circ_max = vest_map.get(t,m_current)
-        if circ_max<m_current:
-            # si la supply max baisse => keep m_current
-            circ_max=m_current
+    max_t = total_periods
+    # on convert df_vest_supply to a map
+    vest_map = {row['period']: row['circ_supply'] for _, row in df_vest_supply.iterrows()}
 
-        # On simule un "net_buy" => par ex. volume_usd / price_token => 'AiTokens'
-        net_buy_ai = volume/price_token
-        old_m = m_current
-        new_m = old_m+net_buy_ai
-        if new_m>circ_max:
-            new_m=circ_max
-        cost_bc = bonding_curve_rbot_for_tokens(old_m,new_m,p0,f)
-        cost_bc_usd=max(cost_bc,0)
-        # fees
-        fee_1pct = cost_bc_usd*0.01
-        burn_usd = fee_1pct*burn_ratio
-        liqu_usd = fee_1pct*liqu_ratio
-        treas_usd = fee_1pct*treas_ratio
-        protocol_usd += liqu_usd
-        treasury_usd += treas_usd
+    for t in range(1, max_t+1):
+        # 1) Maj supply circ (depuis vesting) => la supply possible
+        supply_circ = vest_map.get(t, supply_current)
+        supply_current = supply_circ
 
-        # burn => tokens = burn_usd/price ?
-        burn_tokens=0.0
-        if price_token>0:
-            burn_tokens=burn_usd/price_token
-        # On retire ces burn tokens => new_m - burn_tokens
-        minted_after = new_m - burn_tokens
-        if minted_after<0:
-            burn_tokens=new_m
-            minted_after=0
+        # 2) On applique un volume => volume subit 1% fee
+        # distribution fees
+        burn_usd, burn_tokens, liqu_usd, treas_usd = distribute_fees(volume, burn_ratio, liquidity_ratio, treasury_ratio, price_token)
 
-        # bc liquidity
-        bc_liquidity_usd+=cost_bc_usd
-        m_current=minted_after
+        # On retire burn_tokens de la supply => supply_current = supply_current - burn_tokens
+        # si c'est <0 => on borne
+        new_supply = supply_current - burn_tokens
+        if new_supply<0:
+            burn_tokens = supply_current  # on ne peut pas bruler plus
+            new_supply = 0
 
-        # Trigger AMM
-        if (not secondary_active) and bc_liquidity_usd>=bc_liquidity_threshold and t>=secondary_market_start:
-            secondary_active=True
-            portion_pool=bc_liquidity_usd*pool_percentage
-            bc_liquidity_usd-=portion_pool
-            # moit moit
-            # Ai price = ?
-            # On approx "p0*f^m_current"
-            approx_price = p0*(f**(m_current)) if m_current>0 else p0
-            pool_rbot = portion_pool/2
-            pool_ai = (portion_pool/2)/approx_price if approx_price>0 else 0
-            invariant_k = pool_rbot*pool_ai
+        # Impact sur price (toy model): ex. Delta = burn_tokens / 1_000_000 ...
+        # On peut faire un ratio d'offre & demande
+        # On fait un truc simpliste
+        price_delta = (burn_tokens/1e6) 
+        new_price = max(0.000001, price_token + price_delta)
 
-        # si secondary_active => portion_sc = portion_secondary_after => ex: sc_buy = net_buy_ai*portion_sc ?
-        # ... => on skip detail pour concision
-
-        # Impact sur price => toy
-        # ex price = price + (burn_tokens/1e6)
-        price_delta=(burn_tokens/1e6)
-        new_price=max(0.000001, price_token+price_delta)
-
+        # On stocke
         records.append({
-            'scenario_id':scenario_id,
-            'scenario_name':scenario_name,
-            time_unit:t,
-            'circ_max':circ_max,
-            'old_m':old_m,
-            'new_m':new_m,
-            'burn_tokens':burn_tokens,
-            'bc_liquidity_usd':bc_liquidity_usd,
-            'secondary_active':secondary_active,
-            'pool_rbot':pool_rbot,
-            'pool_ai':pool_ai,
-            'price_before':price_token,
-            'price_after':new_price,
-            'cost_bc_usd': cost_bc_usd,
-            'protocol_usd': protocol_usd,
-            'treasury_usd': treasury_usd,
+            'scenario_name': scenario_name,
+            'scenario_id': scenario_id,
+            time_unit: t,
+            'volume_usd': volume,
+            'burn_usd': burn_usd,
+            'burn_tokens': burn_tokens,
+            'liquidity_usd': liqu_usd,
+            'treasury_usd': treas_usd,
+            'supply_before': supply_current,
+            'supply_after': new_supply,
+            'price_before': price_token,
+            'price_after': new_price,
         })
 
         # update
-        price_token=new_price
-        volume*= (1.0+growth_percent/100.0)
+        supply_current = new_supply
+        price_token = new_price
+        volume *= (1.0 + growth_percent/100.0)
 
-    return pd.DataFrame(records)
+    df_res = pd.DataFrame(records)
+    return df_res
 
 
-# =======================
-#   APP
-# =======================
+# ============================
+#  STREAMLIT APP
+# ============================
 def page_app():
-    st.title("Full Tokenomics Sim: Vesting + BC + Secondary + Fees + Volume Growth")
+    st.title("Tokenomics with Vesting + Fees Distribution + Volume Growth + Burn Price Impact")
 
-    # ----------------------
-    # 1) Table Vesting
-    # ----------------------
-    st.header("1) Configure Vesting & Allocations")
-    st.markdown("Définissez la répartition (TGE%, lock, vest...).")
-
-    default_vest = pd.DataFrame({
-        'allocation_name':["Team","Private","Public","Treasury"],
-        'total_tokens':[1_000_000,2_000_000,3_000_000,4_000_000],
-        'tge_percent':[10,25,100,100],
+    # 1) Table vesting
+    st.header("Step 1: Vesting Table (allocations)")
+    default_vest_alloc = pd.DataFrame({
+        'allocation_name': ["Team","Private","Public","Treasury"],
+        'total_tokens': [1000000, 2000000, 3000000, 4000000],
+        'tge_percent': [10,25,100,100],
         'lock_period':[6,0,0,0],
         'vesting_period':[18,12,0,0],
     })
+    st.markdown("Modifiez la table si nécessaire")
+    vest_alloc_edited = st.data_editor(default_vest_alloc, key="vesting_alloc_editor")
 
-    vest_edited = st.data_editor(default_vest, key="vest_alloc_editor", help="All allocations with TGE %, lock, vesting.\nWill define the max circ supply over time.")
-    colA, colB= st.columns(2)
+    colA, colB = st.columns(2)
     with colA:
-        time_unit_vest=st.selectbox("Time Unit pour Vesting ?",
-                                    ["Days","Months"], index=1,
-                                    help="Choisissez si la vesting table est en jours ou mois.")
+        time_unit_vest = st.selectbox("Time Unit (Days or Months) for vesting",["Days","Months"], index=1)
     with colB:
-        total_periods_vest=st.number_input("Nombre total de périodes (pour la courbe vesting)",
-                                           1,5000,36,
-                                           help="Sur combien de périodes on veut calculer le déblocage total?")
+        total_periods_vest = st.number_input("Total Periods for vesting schedule",1,5000,36)
 
-    if st.button("Compute Vesting", help="Cliquez pour générer la courbe de supply circulante."):
-        df_vest_result=compute_vesting_schedule(vest_edited, total_periods_vest,time_unit_vest)
-        st.session_state['df_vest'] = df_vest_result
+    if st.button("Compute Vesting Schedule", key="compute_vesting"):
+        df_vest = compute_vesting_schedule(vest_alloc_edited, total_periods_vest, time_unit_vest)
+        st.session_state['df_vest'] = df_vest
         st.session_state['time_unit_vest'] = time_unit_vest
-        st.success("Vesting computed & stored.")
-        st.dataframe(df_vest_result.head(50))
-        fig_vest= px.line(df_vest_result,x='period',y='circ_supply',title="Courbe Circulante (Vesting)")
-        st.plotly_chart(fig_vest,use_container_width=True)
+        st.success("Vesting schedule computed & stored.")
+        st.dataframe(df_vest.head(50))
+        fig_vest = px.line(df_vest, x='period', y='circ_supply', title="Vesting-based Circulating Supply")
+        st.plotly_chart(fig_vest, use_container_width=True)
 
     st.write("---")
 
-    # ----------------------
-    # 2) Multi-Scen
-    # ----------------------
-    st.header("2) Configurer Multi-Scenarios (Bonding Curve, Fees, etc.)")
+    # 2) Multi-scenarios
+    st.header("Step 2: Multi-Scenarios & Fees distribution")
 
     if 'df_vest' not in st.session_state:
-        st.warning("Compute Vesting first!")
+        st.warning("Compute the vesting schedule first.")
         return
 
-    df_vest_ready= st.session_state['df_vest']
-    time_unit_ready= st.session_state['time_unit_vest']
+    df_vesting_ready = st.session_state['df_vest']
+    time_unit_ready = st.session_state['time_unit_vest']
 
-    st.sidebar.title("Scenarios")
-    n_scen= st.sidebar.number_input("Number of Scenarios",1,5,1,help="Combien de scénarios différents à comparer?")
-    scenarios_data=[]
+    st.sidebar.title("Scenarios config")
+    n_scen = st.sidebar.number_input("Number of Scenarios",1,5,1,key="nscen_key")
+
+    scenarios_param = []
     for i in range(n_scen):
         with st.sidebar.expander(f"Scenario {i+1}"):
-            sc_name= st.text_input(f"Name scenario {i+1}", value=f"S{i+1}",
-                                   key=f"scn_name_{i}",
-                                   help="Nom du scénario (ex: 'Bull run').")
+            sc_name = st.text_input(f"Name S{i+1}", value=f"Scenario_{i+1}", key=f"sc_name_{i}")
+            periods_sim = st.number_input(f"Total Periods (S{i+1})",1,5000, int(df_vesting_ready['period'].max()), key=f"per_{i}_{sc_name}")
+            # fees distribution: burn / liquidity / treasury => sum <=1
+            st.markdown("**Repartition of 1% Fee**")
+            burn_ratio = st.slider(f"Burn ratio (S{i+1})",0.0,1.0,0.3,0.05,key=f"b_{i}_{sc_name}")
+            liqu_ratio = st.slider(f"Liquidity ratio (S{i+1})",0.0,1.0,0.3,0.05,key=f"l_{i}_{sc_name}")
+            # on calcule 1 - burn - liqu => treasury
+            treas_ratio = 1.0 - burn_ratio - liqu_ratio
+            st.write(f"Treasury ratio ~ {treas_ratio:.2f} (auto)")
 
-            # Period sim
-            per_sim= st.number_input(f"Periods sim (S{i+1})",1,5000, int(df_vest_ready['period'].max()),
-                                     key=f"ps_{i}_{sc_name}",
-                                     help="Durée totale de la simulation (jours/mois)")
+            init_volume = st.number_input(f"Initial Volume $ (S{i+1})",100.0,1e9,100000.0, key=f"iv_{i}_{sc_name}")
+            growth_percent = st.slider(f"Growth volume % (S{i+1})", -10.0,50.0,5.0, key=f"g_{i}_{sc_name}")
 
-            # Volume init / growth
-            init_vol= st.number_input(f"Initial Volume $ (S{i+1})",100.0,1e9,100000.0,
-                                      key=f"iv_{i}_{sc_name}",
-                                      help="Volume initial de trading en $ sur la BC.")
-            growth_pct= st.slider(f"Volume Growth % (S{i+1})", -10.0,50.0,5.0, key=f"g_{i}_{sc_name}",
-                                  help="Croissance du volume par période")
-
-            # Fees
-            st.markdown("**Répartition du 1% Fee**")
-            burn_ratio= st.slider(f"Burn ratio (S{i+1})", 0.0,1.0,0.3,0.05,
-                                  key=f"br_{i}_{sc_name}",
-                                  help="Fraction du 1% allouée au burn.")
-            liqu_ratio= st.slider(f"Liquidity ratio (S{i+1})",0.0,1.0,0.3,0.05,
-                                  key=f"lr_{i}_{sc_name}",
-                                  help="Fraction du 1% allouée à la liquidity.")
-            treas_ratio= 1.0- burn_ratio - liqu_ratio
-            st.write(f"Treasury ratio = {treas_ratio:.2f}")
-
-            # BC exponent
-            p0_ = st.number_input(f"p0 (S{i+1})",0.000001,1e5,1.0,
-                                  key=f"p0_{i}_{sc_name}",
-                                  help="Prix initial du token BC (premier minted).")
-            f_ = st.number_input(f"f exponent (S{i+1})",0.9999,5.0,1.0001,0.0001,
-                                 key=f"f_{i}_{sc_name}",
-                                 help="Facteur exponentiel f dans la formule BC exponentielle")
-
-            # Activation secondary
-            bc_threshold= st.number_input(f"BC Liquidity threshold $ (S{i+1})",0.0,1e9,1_000_000.0,
-                                          key=f"bc_th_{i}_{sc_name}",
-                                          help="Montant $ accumulé via BC pour activer le marché secondaire.")
-            pool_perc= st.slider(f"pool % for AMM (S{i+1})",0.0,1.0,0.2,0.05,
-                                 key=f"poolp_{i}_{sc_name}",
-                                 help="Fraction de la bc_liquidity injectée à l'AMM.")
-            sm_start= st.number_input(f"Secondary Market earliest start (S{i+1})",1,9999,12,
-                                      key=f"smst_{i}_{sc_name}",
-                                      help="Période min avant de pouvoir activer le marché secondaire.")
-            sc_part= st.slider(f"Portion trades SC after activation (S{i+1})",0.0,1.0,0.5,0.05,
-                               key=f"scp_{i}_{sc_name}",
-                               help="Fraction de trades routés vers le secondary market quand actif.")
-
-            scenarios_data.append({
+            scenarios_param.append({
                 'scenario_id': i+1,
                 'scenario_name': sc_name,
-                'total_periods_sim': int(per_sim),
-                'init_volume_usd': float(init_vol),
-                'growth_percent': float(growth_pct),
-                'burn_ratio': float(burn_ratio),
-                'liquidity_ratio': float(liqu_ratio),
-                'treasury_ratio': float(treas_ratio),
-                'p0': float(p0_),
-                'f': float(f_),
-                'bc_liquidity_threshold': float(bc_threshold),
-                'pool_percentage': float(pool_perc),
-                'secondary_market_start': int(sm_start),
-                'portion_secondary_after': float(sc_part)
+                'total_periods_sim': int(periods_sim),
+                'burn_ratio': burn_ratio,
+                'liquidity_ratio': liqu_ratio,
+                'treasury_ratio': treas_ratio,
+                'init_volume_usd': float(init_volume),
+                'growth_percent': float(growth_percent)
             })
 
-    if st.button("Run All Scenarios",help="Lance la simulation pour chaque scénario."):
-        all_dfs=[]
-        for sp in scenarios_data:
-            sub_vest= df_vest_ready[df_vest_ready['period']<=sp['total_periods_sim']].copy()
+    # 3) Run
+    if st.button("Run All Scenarios", key="run_scen"):
+        all_dfs = []
+        for sp in scenarios_param:
+            sub_vest = df_vesting_ready[df_vesting_ready['period']<=sp['total_periods_sim']].copy()
 
-            df_res= simulate_scenario(
+            df_res = simulate_scenario(
                 scenario_name=sp['scenario_name'],
                 scenario_id=sp['scenario_id'],
                 total_periods=sp['total_periods_sim'],
-                time_unit= time_unit_ready,
-                df_vest= sub_vest,
-                init_volume_usd= sp['init_volume_usd'],
-                growth_percent= sp['growth_percent'],
-                burn_ratio= sp['burn_ratio'],
-                liqu_ratio= sp['liquidity_ratio'],
-                treas_ratio= sp['treasury_ratio'],
-                p0= sp['p0'],
-                f= sp['f'],
-                bc_liquidity_threshold= sp['bc_liquidity_threshold'],
-                pool_percentage= sp['pool_percentage'],
-                secondary_market_start= sp['secondary_market_start'],
-                portion_secondary_after= sp['portion_secondary_after']
+                time_unit=time_unit_ready,
+                df_vest_supply=sub_vest,
+                init_volume_usd=sp['init_volume_usd'],
+                growth_percent=sp['growth_percent'],
+                burn_ratio=sp['burn_ratio'],
+                liquidity_ratio=sp['liquidity_ratio'],
+                treasury_ratio=sp['treasury_ratio']
             )
             all_dfs.append(df_res)
 
-        df_merged= pd.concat(all_dfs,ignore_index=True)
-        st.write("### Résultats Simulation (Tous Scénarios)")
-        st.dataframe(df_merged.head(1000))
+        df_merged = pd.concat(all_dfs, ignore_index=True)
+        st.write("### Simulation Results")
+        st.dataframe(df_merged.head(2000))
 
-        tcol= df_merged.columns[2] # days or months col
-        fig_bc = px.line(
-            df_merged, x=tcol, y='bc_liquidity_usd',
-            color='scenario_name',
-            title="Bonding Curve Liquidity ($) Over Time"
-        )
-        st.plotly_chart(fig_bc,use_container_width=True)
-
+        tcol = df_merged.columns[2]  # 'Days' or 'Months'
         fig_burn = px.line(
-            df_merged, x=tcol, y='burn_tokens',
+            df_merged,
+            x=tcol,
+            y='burn_tokens',
             color='scenario_name',
-            title="Burn Tokens nominal Over Time"
+            title="Burn Tokens (nominal) Over Time"
         )
-        st.plotly_chart(fig_burn,use_container_width=True)
+        st.plotly_chart(fig_burn, use_container_width=True)
 
         fig_price = px.line(
-            df_merged, x=tcol, y=['price_before','price_after'],
+            df_merged,
+            x=tcol,
+            y=['price_before','price_after'],
             color='scenario_name',
-            title="Price Impact (before/after) each period"
+            title="Token Price Impact"
         )
-        st.plotly_chart(fig_price,use_container_width=True)
+        st.plotly_chart(fig_price, use_container_width=True)
 
-        st.success("Simulation done. Explore the table & charts.")
+        st.success("Done simulation. Explore above table/graphs.")
 
 
 def main():
